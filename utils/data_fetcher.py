@@ -1,16 +1,16 @@
 """
 Data fetcher for Expectations Investing app.
-Primary source: Financial Modeling Prep (FMP) API — reliable on hosted servers.
-Fallback: yfinance — works locally but rate-limited on Streamlit Cloud.
+Primary: Alpha Vantage (free API key, no IP blocking, works on Streamlit Cloud).
+Fallback: yfinance (local use only).
 
-Get a free FMP key at: https://financialmodelingprep.com/developer/docs
-Free tier: 250 requests/day, no IP blocking.
+Get a free Alpha Vantage key at: https://www.alphavantage.co/support/#api-key
+Free tier: 25 calls/day, 5/min. One ticker uses ~5 calls.
 """
 import requests
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional
 import time
 
 
@@ -50,164 +50,177 @@ class CompanyData:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _safe(val, default=0.0):
-    if val is None or (isinstance(val, float) and np.isnan(val)):
+    if val is None or val == "None" or val == "-":
         return default
     try:
-        return float(val)
+        v = float(str(val).replace(",", ""))
+        return default if np.isnan(v) else v
     except Exception:
         return default
 
 
-def _avg(lst: list) -> float:
-    clean = [x for x in lst if x is not None and not (isinstance(x, float) and np.isnan(x))]
+def _avg(lst):
+    clean = [x for x in lst if x is not None and not np.isnan(x)]
     return float(np.mean(clean)) if clean else 0.0
 
 
-def _cagr(start, end, years) -> float:
+def _cagr(start, end, years):
     if start <= 0 or end <= 0 or years <= 0:
         return 0.0
     return (end / start) ** (1 / years) - 1
 
 
-def _fetch_rf_rate() -> float:
-    """Live 10-yr Treasury from FRED."""
+def _fetch_rf_rate():
     try:
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
-        r = requests.get(url, timeout=8)
+        r = requests.get(
+            "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10",
+            timeout=8
+        )
         for line in reversed(r.text.strip().split("\n")):
             parts = line.split(",")
             if len(parts) == 2 and parts[1].strip() not in (".", ""):
                 return float(parts[1].strip()) / 100
     except Exception:
         pass
-    return 0.045   # fallback
+    return 0.045
 
 
-# ── FMP fetcher ───────────────────────────────────────────────────────────────
-
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+AV_BASE = "https://www.alphavantage.co/query"
 
 
-def _fmp_get(path: str, api_key: str, params: dict = None) -> dict | list:
-    p = params or {}
-    p["apikey"] = api_key
-    r = requests.get(f"{FMP_BASE}/{path}", params=p, timeout=12)
-    r.raise_for_status()
-    return r.json()
+def _av(function: str, symbol: str, api_key: str, extra: dict = None) -> dict:
+    """Single Alpha Vantage request with rate-limit retry."""
+    params = {"function": function, "symbol": symbol, "apikey": api_key}
+    if extra:
+        params.update(extra)
+    for attempt in range(3):
+        r = requests.get(AV_BASE, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        # AV rate-limit message
+        if "Note" in data or "Information" in data:
+            if attempt < 2:
+                time.sleep(15)
+                continue
+            raise ValueError(
+                "Alpha Vantage rate limit reached (5 calls/min on free tier). "
+                "Wait 60 seconds and try again."
+            )
+        return data
+    return {}
 
 
-def _fetch_fmp(ticker: str, api_key: str) -> CompanyData:
+# ── Alpha Vantage fetcher ─────────────────────────────────────────────────────
+
+def _fetch_av(ticker: str, api_key: str) -> CompanyData:
     warnings = []
     t = ticker.upper()
 
-    # Profile (price, market cap, beta, shares, sector, etc.)
-    profile_data = _fmp_get(f"profile/{t}", api_key)
-    if not profile_data or not isinstance(profile_data, list):
-        raise ValueError(f"No data found for '{t}'. Check the ticker symbol.")
-    p = profile_data[0]
+    # 1. Company overview (price, market cap, beta, sector, etc.)
+    overview = _av("OVERVIEW", t, api_key)
+    if not overview or "Symbol" not in overview:
+        raise ValueError(
+            f"No data found for '{t}'. "
+            "Check the ticker symbol — Alpha Vantage uses US exchange symbols (e.g. DPZ, AAPL)."
+        )
 
-    name          = p.get("companyName", t)
-    sector        = p.get("sector", "Unknown")
-    industry      = p.get("industry", "Unknown")
-    currency      = p.get("currency", "USD")
-    current_price = _safe(p.get("price"), 0)
-    market_cap_m  = _safe(p.get("mktCap"), 0) / 1e6
-    shares_m      = _safe(p.get("sharesOutstanding"), 0) / 1e6
-    beta          = _safe(p.get("beta"), 1.0)
+    # 2. Current price
+    quote = _av("GLOBAL_QUOTE", t, api_key)
+    current_price = _safe(quote.get("Global Quote", {}).get("05. price"), 0)
 
-    # Income statement (annual, last 4 years)
-    income = _fmp_get(f"income-statement/{t}", api_key, {"limit": 4, "period": "annual"})
-    if not income or not isinstance(income, list):
-        raise ValueError(f"No financial statements found for '{t}'.")
+    # 3. Income statement
+    time.sleep(12)   # stay under 5 calls/min on free tier
+    inc_raw = _av("INCOME_STATEMENT", t, api_key)
+    inc_years = inc_raw.get("annualReports", [])[:4]   # most recent first
 
-    revenues    = [_safe(y.get("revenue"), 0)          for y in income]
-    op_incomes  = [_safe(y.get("operatingIncome"), 0)  for y in income]
-    tax_exps    = [_safe(y.get("incomeTaxExpense"), 0) for y in income]
-    int_exps    = [_safe(y.get("interestExpense"), 0)  for y in income]
-    net_incomes = [_safe(y.get("netIncome"), 0)        for y in income]
+    # 4. Balance sheet
+    time.sleep(12)
+    bal_raw = _av("BALANCE_SHEET", t, api_key)
+    bal_years = bal_raw.get("annualReports", [])[:4]
 
-    # Balance sheet (annual, last 4 years)
-    balance = _fmp_get(f"balance-sheet-statement/{t}", api_key, {"limit": 4, "period": "annual"})
-    if not balance:
-        balance = []
+    # 5. Cash flow
+    time.sleep(12)
+    cf_raw = _av("CASH_FLOW", t, api_key)
+    cf_years = cf_raw.get("annualReports", [])[:4]
 
-    total_assets_list = [_safe(y.get("totalAssets"), 0)            for y in balance]
-    cash_list         = [_safe(y.get("cashAndCashEquivalents"), 0)  for y in balance]
-    ca_list           = [_safe(y.get("totalCurrentAssets"), 0)      for y in balance]
-    cl_list           = [_safe(y.get("totalCurrentLiabilities"), 0) for y in balance]
-    std_list          = [_safe(y.get("shortTermDebt"), 0)           for y in balance]
-    ltd_list          = [_safe(y.get("longTermDebt"), 0)            for y in balance]
+    # ── Parse overview ────────────────────────────────────────────────────────
+    name          = overview.get("Name", t)
+    sector        = overview.get("Sector", "Unknown")
+    industry      = overview.get("Industry", "Unknown")
+    currency      = overview.get("Currency", "USD")
+    market_cap_m  = _safe(overview.get("MarketCapitalization"), 0) / 1e6
+    shares_m      = _safe(overview.get("SharesOutstanding"), 0) / 1e6
+    beta          = _safe(overview.get("Beta"), 1.0)
+    pe_ratio      = _safe(overview.get("TrailingPE") or overview.get("ForwardPE"), 20.0)
 
-    total_debt_m = (_safe(balance[0].get("totalDebt"), 0) if balance else 0) / 1e6
+    # ── Income statement ──────────────────────────────────────────────────────
+    revenues   = [_safe(y.get("totalRevenue"), 0)          for y in inc_years]
+    op_incomes = [_safe(y.get("operatingIncome"), 0)       for y in inc_years]
+    tax_exps   = [_safe(y.get("incomeTaxExpense"), 0)      for y in inc_years]
+    int_exps   = [_safe(y.get("interestExpense"), 0)       for y in inc_years]
 
-    # Cash flow statement
-    cashflow = _fmp_get(f"cash-flow-statement/{t}", api_key, {"limit": 4, "period": "annual"})
-    if not cashflow:
-        cashflow = []
+    # ── Balance sheet ─────────────────────────────────────────────────────────
+    ca_list    = [_safe(y.get("totalCurrentAssets"), 0)    for y in bal_years]
+    cl_list    = [_safe(y.get("totalCurrentLiabilities"), 0) for y in bal_years]
+    cash_list  = [_safe(y.get("cashAndCashEquivalentsAtCarryingValue"), 0) for y in bal_years]
+    std_list   = [_safe(y.get("currentDebt") or y.get("shortTermDebt"), 0) for y in bal_years]
+    ltd_list   = [_safe(y.get("longTermDebt"), 0)          for y in bal_years]
 
-    capex_list = [abs(_safe(y.get("capitalExpenditure"), 0))        for y in cashflow]
-    depr_list  = [_safe(y.get("depreciationAndAmortization"), 0)    for y in cashflow]
+    total_debt_m = ((ltd_list[0] if ltd_list else 0) + (std_list[0] if std_list else 0)) / 1e6
+
+    # ── Cash flow ─────────────────────────────────────────────────────────────
+    capex_list = [abs(_safe(y.get("capitalExpenditures"), 0))       for y in cf_years]
+    depr_list  = [_safe(y.get("depreciationDepletionAndAmortization") or
+                         y.get("depreciation"), 0)                   for y in cf_years]
 
     # ── Value drivers ─────────────────────────────────────────────────────────
 
-    # Sales growth (3-yr CAGR, most recent = index 0)
     base_sales_m = revenues[0] / 1e6 if revenues else 0
     if len(revenues) >= 2:
         sales_growth_3yr = _cagr(revenues[-1], revenues[0], len(revenues) - 1)
     else:
-        sales_growth_3yr = 0.05
-        warnings.append("Limited revenue history; defaulting growth to 5%.")
+        sales_growth_3yr = _safe(overview.get("QuarterlyRevenueGrowthYOY"), 0.05)
+        warnings.append("Limited revenue history.")
 
-    # Operating margin (3-yr avg)
     margins = [o / r for o, r in zip(op_incomes, revenues) if r > 0]
     op_margin_3yr = _avg(margins[:3]) if margins else 0.15
 
-    # Cash tax rate (tax / op income, 3-yr avg)
     tax_rates = [abs(tx) / oi for tx, oi in zip(tax_exps, op_incomes) if oi > 0]
     cash_tax_rate_3yr = min(max(_avg(tax_rates[:3]) if tax_rates else 0.21, 0.05), 0.50)
 
-    # IFCR = (CapEx - Dep) / ΔSales
     ifcr_list = []
     for i in range(min(len(capex_list), len(depr_list), len(revenues) - 1)):
-        d_sales = revenues[i] - revenues[i + 1]
-        if d_sales > 0:
-            ifcr_list.append((capex_list[i] - depr_list[i]) / d_sales)
+        ds = revenues[i] - revenues[i + 1]
+        if ds > 0:
+            ifcr_list.append((capex_list[i] - depr_list[i]) / ds)
     ifcr_3yr = max(0.0, _avg(ifcr_list) if ifcr_list else 0.10)
 
-    # IWCR = ΔOp. Working Capital / ΔSales
     iwcr_list = []
     for i in range(min(len(ca_list), len(cl_list), len(cash_list), len(revenues) - 1)):
         st_i  = std_list[i]     if i     < len(std_list) else 0
         st_i1 = std_list[i + 1] if i + 1 < len(std_list) else 0
         owc_c = ca_list[i]     - cash_list[i]     - (cl_list[i]     - st_i)
         owc_p = ca_list[i + 1] - cash_list[i + 1] - (cl_list[i + 1] - st_i1)
-        d_owc   = owc_c - owc_p
-        d_sales = revenues[i] - revenues[i + 1]
-        if d_sales > 0:
-            iwcr_list.append(d_owc / d_sales)
+        ds    = revenues[i] - revenues[i + 1]
+        if ds > 0:
+            iwcr_list.append((owc_c - owc_p) / ds)
     iwcr_3yr = min(max(_avg(iwcr_list) if iwcr_list else 0.05, 0.0), 0.50)
 
-    # Non-operating
     total_cash_m  = cash_list[0] / 1e6 if cash_list else 0
     excess_cash_m = max(0.0, total_cash_m - base_sales_m * 0.01)
 
-    # WACC
-    rf_rate = _fetch_rf_rate()
-    emp     = 0.055
-    ke      = rf_rate + beta * emp
-
-    if int_exps and total_debt_m > 0:
-        pretax_kd = min(max(abs(int_exps[0]) / (total_debt_m * 1e6), 0.01), 0.15)
-    else:
-        pretax_kd = rf_rate + 0.015
-
+    # ── WACC ─────────────────────────────────────────────────────────────────
+    rf_rate   = _fetch_rf_rate()
+    emp       = 0.055
+    ke        = rf_rate + beta * emp
+    pretax_kd = (abs(int_exps[0]) / (total_debt_m * 1e6)
+                 if int_exps and total_debt_m > 0
+                 else rf_rate + 0.015)
+    pretax_kd = min(max(pretax_kd, 0.01), 0.15)
     total_cap = market_cap_m + total_debt_m
     we = market_cap_m / total_cap if total_cap > 0 else 0.8
     wd = total_debt_m / total_cap if total_cap > 0 else 0.2
     wacc = we * ke + wd * pretax_kd * (1 - cash_tax_rate_3yr)
-
-    # P/E
-    pe_ratio = current_price / (net_incomes[0] / (shares_m * 1e6)) if (net_incomes and shares_m > 0 and net_incomes[0] > 0) else 20.0
 
     return CompanyData(
         ticker=t, name=name, sector=sector, industry=industry,
@@ -220,56 +233,53 @@ def _fetch_fmp(ticker: str, api_key: str) -> CompanyData:
         underfunded_pension_m=0.0, rf_rate=rf_rate,
         equity_market_premium=emp, equity_weight=we, debt_weight=wd,
         pretax_cost_of_debt=pretax_kd, wacc=wacc,
-        currency=currency, warnings=warnings, raw=p,
+        currency=currency, warnings=warnings, raw=overview,
     )
 
 
-# ── yfinance fallback ─────────────────────────────────────────────────────────
+# ── yfinance fallback (local only) ────────────────────────────────────────────
 
 def _fetch_yfinance(ticker: str) -> CompanyData:
-    """Fallback for local use. Rate-limited on Streamlit Cloud."""
     import yfinance as yf
-    warnings = ["Using yfinance fallback — may be rate-limited on hosted servers."]
+    warnings = ["Using yfinance — may be rate-limited on Streamlit Cloud."]
     t = yf.Ticker(ticker)
     info = t.info
-
     if not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None):
         raise ValueError(f"No data found for '{ticker}'.")
 
-    def col_vals(df, *candidates):
-        for c in candidates:
-            if c in df.index:
-                s = df.loc[c]
-                return [float(v) for v in s.values
+    def col_vals(df, *keys):
+        for k in keys:
+            if k in df.index:
+                return [float(v) for v in df.loc[k].values
                         if v is not None and not (isinstance(v, float) and np.isnan(v))]
         return []
 
-    income  = t.income_stmt
-    balance = t.balance_sheet
-    cf      = t.cashflow
+    inc = t.income_stmt
+    bal = t.balance_sheet
+    cf  = t.cashflow
 
-    rev   = col_vals(income, "Total Revenue", "Revenue")
-    op_i  = col_vals(income, "Operating Income", "EBIT")
-    tax_v = col_vals(income, "Tax Provision", "Income Tax Expense")
-    capex = col_vals(cf, "Capital Expenditure", "Purchase Of Property Plant And Equipment")
-    depr  = col_vals(cf, "Depreciation And Amortization", "Depreciation Amortization Depletion")
-    ca    = col_vals(balance, "Current Assets", "Total Current Assets")
-    cl    = col_vals(balance, "Current Liabilities", "Total Current Liabilities")
-    csh   = col_vals(balance, "Cash And Cash Equivalents", "Cash")
-    std   = col_vals(balance, "Current Debt", "Short Term Debt")
+    rev  = col_vals(inc, "Total Revenue", "Revenue")
+    opi  = col_vals(inc, "Operating Income", "EBIT")
+    tax  = col_vals(inc, "Tax Provision", "Income Tax Expense")
+    cap  = col_vals(cf,  "Capital Expenditure", "Purchase Of Property Plant And Equipment")
+    dep  = col_vals(cf,  "Depreciation And Amortization", "Depreciation Amortization Depletion")
+    ca   = col_vals(bal, "Current Assets", "Total Current Assets")
+    cl   = col_vals(bal, "Current Liabilities", "Total Current Liabilities")
+    csh  = col_vals(bal, "Cash And Cash Equivalents", "Cash")
+    std  = col_vals(bal, "Current Debt", "Short Term Debt")
 
     base_sales_m     = rev[0] / 1e6 if rev else _safe(info.get("totalRevenue"), 1e9) / 1e6
     sales_growth_3yr = _cagr(rev[-1], rev[0], len(rev) - 1) if len(rev) >= 2 else _safe(info.get("revenueGrowth"), 0.05)
-    margins          = [o / r for o, r in zip(op_i, rev) if r > 0]
+    margins          = [o / r for o, r in zip(opi, rev) if r > 0]
     op_margin_3yr    = _avg(margins[:3]) if margins else _safe(info.get("operatingMargins"), 0.15)
-    tax_rates_       = [abs(tx) / oi for tx, oi in zip(tax_v, op_i) if oi > 0]
-    cash_tax_rate_3yr = min(max(_avg(tax_rates_[:3]) if tax_rates_ else _safe(info.get("effectiveTaxRate"), 0.21), 0.05), 0.50)
+    tax_rates        = [abs(tx) / oi for tx, oi in zip(tax, opi) if oi > 0]
+    cash_tax_rate_3yr = min(max(_avg(tax_rates[:3]) if tax_rates else 0.21, 0.05), 0.50)
 
     ifcr_list = []
-    for i in range(min(len(capex), len(depr), len(rev) - 1)):
+    for i in range(min(len(cap), len(dep), len(rev) - 1)):
         ds = rev[i] - rev[i + 1]
         if ds > 0:
-            ifcr_list.append((abs(capex[i]) - abs(depr[i])) / ds)
+            ifcr_list.append((abs(cap[i]) - abs(dep[i])) / ds)
     ifcr_3yr = max(0.0, _avg(ifcr_list) if ifcr_list else 0.10)
 
     iwcr_list = []
@@ -289,12 +299,11 @@ def _fetch_yfinance(ticker: str) -> CompanyData:
     shares_m      = _safe(info.get("sharesOutstanding"), 0) / 1e6
     beta          = _safe(info.get("beta"), 1.0)
     excess_cash_m = max(0.0, total_cash_m - base_sales_m * 0.01)
-
-    rf_rate   = _fetch_rf_rate()
-    emp       = 0.055
-    ke        = rf_rate + beta * emp
-    pretax_kd = rf_rate + 0.015
-    total_cap = market_cap_m + total_debt_m
+    rf_rate       = _fetch_rf_rate()
+    emp           = 0.055
+    ke            = rf_rate + beta * emp
+    pretax_kd     = rf_rate + 0.015
+    total_cap     = market_cap_m + total_debt_m
     we = market_cap_m / total_cap if total_cap > 0 else 0.8
     wd = total_debt_m / total_cap if total_cap > 0 else 0.2
     wacc = we * ke + wd * pretax_kd * (1 - cash_tax_rate_3yr)
@@ -318,14 +327,13 @@ def _fetch_yfinance(ticker: str) -> CompanyData:
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def fetch_company_data(ticker: str, fmp_api_key: str = "") -> CompanyData:
+def fetch_company_data(ticker: str, api_key: str = "") -> CompanyData:
     """
     Fetch company data.
-    - If fmp_api_key is provided: use FMP (reliable on all servers).
-    - Otherwise: fall back to yfinance (works locally, rate-limited on cloud).
+    - api_key provided: use Alpha Vantage (reliable on all servers).
+    - no key: fall back to yfinance (works locally, often rate-limited on cloud).
     """
     ticker = ticker.upper().strip()
-    if fmp_api_key and fmp_api_key.strip():
-        return _fetch_fmp(ticker, fmp_api_key.strip())
-    else:
-        return _fetch_yfinance(ticker)
+    if api_key and api_key.strip():
+        return _fetch_av(ticker, api_key.strip())
+    return _fetch_yfinance(ticker)

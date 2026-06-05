@@ -17,14 +17,14 @@ st.title("🔍 Ticker Lookup")
 st.caption("Enter any stock ticker to run a full Expectations Investing analysis with live data.")
 
 # ── API key input ─────────────────────────────────────────────────────────────
-with st.expander("⚙️ Data source — enter your free FMP API key", expanded=not st.session_state.get("fmp_key")):
+with st.expander("⚙️ Data source — enter your free Alpha Vantage API key", expanded=not st.session_state.get("fmp_key")):
     st.markdown(
         "Yahoo Finance blocks hosted servers. Get a **free API key** at "
-        "[financialmodelingprep.com](https://financialmodelingprep.com/developer/docs) "
-        "(takes 30 seconds, 250 free calls/day) and paste it below."
+        "[alphavantage.co](https://www.alphavantage.co/support/#api-key) "
+        "(takes 30 seconds, 25 free calls/day (5 per ticker)) and paste it below."
     )
     fmp_key_input = st.text_input(
-        "FMP API Key", 
+        "Alpha Vantage API Key", 
         value=st.session_state.get("fmp_key", ""),
         type="password",
         placeholder="paste your key here",
@@ -53,7 +53,7 @@ if fetch_btn and ticker_input:
     st.session_state["ticker"] = ticker_input.strip().upper()
     with st.spinner(f"Fetching {ticker_input.upper()}..."):
         try:
-            data = fetch_company_data(ticker_input, fmp_api_key=fmp_key)
+            data = fetch_company_data(ticker_input, api_key=fmp_key)
             st.session_state["company_data"] = data
             st.session_state["data_loaded"] = True
         except Exception as e:
