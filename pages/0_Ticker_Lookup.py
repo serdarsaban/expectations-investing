@@ -4,7 +4,6 @@ Ticker Lookup — fetches live data and runs full Expectations Investing analysi
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import yfinance as yf
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from utils.data_fetcher import fetch_company_data
@@ -17,25 +16,44 @@ st.markdown('<span class="chapter-badge">LIVE DATA</span>', unsafe_allow_html=Tr
 st.title("🔍 Ticker Lookup")
 st.caption("Enter any stock ticker to run a full Expectations Investing analysis with live data.")
 
+# ── API key input ─────────────────────────────────────────────────────────────
+with st.expander("⚙️ Data source — enter your free FMP API key", expanded=not st.session_state.get("fmp_key")):
+    st.markdown(
+        "Yahoo Finance blocks hosted servers. Get a **free API key** at "
+        "[financialmodelingprep.com](https://financialmodelingprep.com/developer/docs) "
+        "(takes 30 seconds, 250 free calls/day) and paste it below."
+    )
+    fmp_key_input = st.text_input(
+        "FMP API Key", 
+        value=st.session_state.get("fmp_key", ""),
+        type="password",
+        placeholder="paste your key here",
+    )
+    if fmp_key_input:
+        st.session_state["fmp_key"] = fmp_key_input
+        st.success("API key saved for this session.")
+
+fmp_key = st.session_state.get("fmp_key", "")
+
 # ── Ticker input ──────────────────────────────────────────────────────────────
 col_inp, col_btn = st.columns([3, 1])
 with col_inp:
     ticker_input = st.text_input(
-        "ticker", value="DPZ",
+        "ticker", value=st.session_state.get("ticker", "DPZ"),
         placeholder="e.g. AAPL, MSFT, DPZ, TSLA",
         label_visibility="collapsed",
     )
 with col_btn:
     fetch_btn = st.button("Analyse", type="primary", use_container_width=True)
 
-st.caption("US equities: AAPL · UK stocks add suffix: SHEL.L · European: SAP.DE")
+st.caption("US equities: AAPL · UK add suffix: SHEL.L · European: SAP.DE")
 
 # ── Fetch ─────────────────────────────────────────────────────────────────────
-if fetch_btn:
+if fetch_btn and ticker_input:
     st.session_state["ticker"] = ticker_input.strip().upper()
     with st.spinner(f"Fetching {ticker_input.upper()}..."):
         try:
-            data = fetch_company_data(ticker_input)
+            data = fetch_company_data(ticker_input, fmp_api_key=fmp_key)
             st.session_state["company_data"] = data
             st.session_state["data_loaded"] = True
         except Exception as e:
@@ -64,17 +82,16 @@ if st.session_state.get("data_loaded") and st.session_state.get("company_data"):
     # ── Value drivers table ───────────────────────────────────────────────────
     st.divider()
     st.subheader("Value Drivers — 3-Year Historical Averages")
-
     drivers = pd.DataFrame([
-        {"Driver": "Sales (most recent, $M)",         "Value": f"${data.base_sales_m:,.1f}M"},
-        {"Driver": "Sales Growth (3yr CAGR)",          "Value": f"{data.sales_growth_3yr*100:.1f}%"},
-        {"Driver": "Operating Profit Margin (3yr avg)","Value": f"{data.op_margin_3yr*100:.1f}%"},
-        {"Driver": "Cash Tax Rate (3yr avg)",          "Value": f"{data.cash_tax_rate_3yr*100:.1f}%"},
+        {"Driver": "Sales — most recent ($M)",         "Value": f"${data.base_sales_m:,.1f}M"},
+        {"Driver": "Sales Growth — 3yr CAGR",          "Value": f"{data.sales_growth_3yr*100:.1f}%"},
+        {"Driver": "Operating Profit Margin — 3yr avg","Value": f"{data.op_margin_3yr*100:.1f}%"},
+        {"Driver": "Cash Tax Rate — 3yr avg",          "Value": f"{data.cash_tax_rate_3yr*100:.1f}%"},
         {"Driver": "Incr. Fixed-Capital Rate (IFCR)",  "Value": f"{data.ifcr_3yr*100:.1f}%"},
         {"Driver": "Incr. Working-Capital Rate (IWCR)","Value": f"{data.iwcr_3yr*100:.1f}%"},
+        {"Driver": "Excess Cash & Non-Op Assets ($M)", "Value": f"${data.excess_cash_m:,.1f}M"},
+        {"Driver": "Market Value of Debt ($M)",        "Value": f"${data.total_debt_m:,.1f}M"},
         {"Driver": "WACC",                             "Value": f"{data.wacc*100:.2f}%"},
-        {"Driver": "Excess Cash & Non-Op Assets",      "Value": f"${data.excess_cash_m:,.1f}M"},
-        {"Driver": "Market Value of Debt",             "Value": f"${data.total_debt_m:,.1f}M"},
     ])
     st.dataframe(drivers, use_container_width=True, hide_index=True)
 
@@ -106,7 +123,6 @@ if st.session_state.get("data_loaded") and st.session_state.get("company_data"):
     m3.metric("PV of FCFs", f"${res.pv_fcfs:,.0f}M")
     m4.metric("PV of Cont. Value", f"${res.pv_continuing_value:,.0f}M")
 
-    # Year-by-year table
     df_yby = pd.DataFrame([{
         "Year": r.year,
         "Sales ($M)": round(r.sales, 1),
@@ -125,8 +141,7 @@ if st.session_state.get("data_loaded") and st.session_state.get("company_data"):
     fig.add_scatter(x=df_yby["Year"], y=df_yby["FCF ($M)"],
                     name="FCF", mode="lines+markers",
                     line=dict(color="#16a34a", width=2))
-    fig.update_layout(barmode="relative", height=280,
-                      margin=dict(t=10, b=10),
+    fig.update_layout(barmode="relative", height=280, margin=dict(t=10, b=10),
                       xaxis_title="Forecast Year", yaxis_title="$M",
                       legend=dict(orientation="h", y=-0.3))
     st.plotly_chart(fig, use_container_width=True)
@@ -149,15 +164,14 @@ if st.session_state.get("data_loaded") and st.session_state.get("company_data"):
     elif data.sales_growth_3yr < implied_growth * 0.9:
         st.warning("Historical growth is below PIE — the market expects an acceleration not seen historically.")
     else:
-        st.info("Historical growth is in line with PIE.")
+        st.info("Historical growth is broadly in line with PIE.")
 
-    # ── Buy / Sell / Hold ────────────────────────────────────────────────────
+    # ── Buy / Sell / Hold ─────────────────────────────────────────────────────
     st.divider()
     st.subheader("Buy / Sell / Hold — Expected Value")
 
     bear_sv = run_dcf(DCFInputs(**{**inp.__dict__, 'sales_growth': max(0.001, data.sales_growth_3yr - 0.04)})).shareholder_value
     bull_sv = run_dcf(DCFInputs(**{**inp.__dict__, 'sales_growth': data.sales_growth_3yr + 0.04})).shareholder_value
-
     bear_ps = bear_sv / data.shares_outstanding_m if data.shares_outstanding_m else 0
     base_ps = sv_per_share
     bull_ps = bull_sv / data.shares_outstanding_m if data.shares_outstanding_m else 0
@@ -175,15 +189,16 @@ if st.session_state.get("data_loaded") and st.session_state.get("company_data"):
         "Value / Share ($)": f"${s.stock_value:,.2f}",
         "Probability": f"{s.probability*100:.0f}%",
         "Weighted Value ($)": f"${s.weighted:,.2f}",
-    } for s in scenarios] + [
-        {"Scenario": "Expected Value (EV)", "Value / Share ($)": "",
-         "Probability": "100%", "Weighted Value ($)": f"${ev:,.2f}"}
-    ])
+    } for s in scenarios] + [{
+        "Scenario": "Expected Value (EV)",
+        "Value / Share ($)": "",
+        "Probability": "100%",
+        "Weighted Value ($)": f"${ev:,.2f}",
+    }])
     st.dataframe(sc_df, use_container_width=True, hide_index=True)
 
     e1, e2 = st.columns(2)
     e1.metric("Expected Value", f"${ev:,.2f}", f"{upside:+.1f}% vs current ${data.current_price:.2f}")
-
     if upside > 10:
         e2.success("🟢 BUY — EV exceeds price by more than 10%")
     elif upside < -10:
@@ -207,27 +222,3 @@ if st.session_state.get("data_loaded") and st.session_state.get("company_data"):
         {"Component": "WACC",                            "Value": f"{data.wacc*100:.2f}%"},
     ])
     st.dataframe(wacc_df, use_container_width=True, hide_index=True)
-
-    # ── Raw financials ────────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("Raw Financials (last 4 years)")
-
-    ticker_obj = yf.Ticker(data.ticker)
-    tab1, tab2, tab3 = st.tabs(["Income Statement", "Balance Sheet", "Cash Flow"])
-
-    def fmt_stmt(df):
-        if df is None or df.empty:
-            return pd.DataFrame()
-        return df.iloc[:, :4].apply(
-            lambda col: col.map(
-                lambda x: f"${x/1e6:,.1f}M" if isinstance(x, (int, float)) and pd.notna(x) else x
-            )
-        )
-
-    with tab1:
-        st.dataframe(fmt_stmt(ticker_obj.income_stmt), use_container_width=True)
-    with tab2:
-        st.dataframe(fmt_stmt(ticker_obj.balance_sheet), use_container_width=True)
-    with tab3:
-        st.dataframe(fmt_stmt(ticker_obj.cashflow), use_container_width=True)
-
